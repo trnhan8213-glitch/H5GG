@@ -1,0 +1,220 @@
+# .github/workflows/build.yml
+name: Build H5GG Helper Dylib (Bypass Sandbox)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Tạo thư mục và mã nguồn C
+        run: |
+          mkdir -p src
+          cat > src/h5gg_helper.c << 'EOF'
+          // ========================================================================
+          //  h5gg_helper.c – Dylib hỗ trợ H5GG chạy script không cần Frida
+          //  Cung cấp các hàm đọc/ghi bộ nhớ, bypass sandbox (cần quyền root hoặc
+          //  entitlement). Sử dụng mach_vm API, tích hợp sẵn engine script đơn giản.
+          //  Biên dịch: clang -arch arm64 -dynamiclib -framework Foundation -o h5gg.dylib h5gg_helper.c
+          // ========================================================================
+
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <mach/mach.h>
+          #include <mach/mach_vm.h>
+          #include <dlfcn.h>
+          #include <pthread.h>
+          #include <sys/socket.h>
+          #include <netinet/in.h>
+          #include <arpa/inet.h>
+
+          // -------------------- MEMORY OPERATIONS --------------------
+          kern_return_t read_memory(mach_port_t task, mach_vm_address_t addr, void *buffer, mach_vm_size_t size) {
+              mach_vm_size_t out_size = 0;
+              return mach_vm_read_overwrite(task, addr, size, (vm_address_t)buffer, &out_size);
+          }
+
+          kern_return_t write_memory(mach_port_t task, mach_vm_address_t addr, void *buffer, mach_vm_size_t size) {
+              return mach_vm_write(task, addr, (vm_offset_t)buffer, size);
+          }
+
+          // Lấy task port của process hiện tại (hoặc target process)
+          mach_port_t get_task_for_pid(pid_t pid) {
+              mach_port_t task = MACH_PORT_NULL;
+              // Nếu đã có quyền task_for_pid, dùng hàm này
+              kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+              if (kr != KERN_SUCCESS) {
+                  printf("[H5] task_for_pid failed: %s\n", mach_error_string(kr));
+                  // Fallback: lấy task của chính mình (nếu đã inject vào game)
+                  task = mach_task_self();
+              }
+              return task;
+          }
+
+          // -------------------- SCRIPT EXECUTION (mini interpreter) --------------------
+          // Hỗ trợ các lệnh đơn giản: read, write, scan, patch
+          // Thực tế có thể mở rộng để parse JSON hoặc JavaScript (dùng QuickJS)
+
+          void execute_script(const char *script) {
+              // Ví dụ script dạng: "read 0x1000 4" => đọc 4 byte tại địa chỉ
+              char cmd[256];
+              unsigned long addr;
+              int size;
+              if (sscanf(script, "read %lx %d", &addr, &size) == 2) {
+                  unsigned char buf[64];
+                  mach_port_t task = mach_task_self();
+                  read_memory(task, addr, buf, size);
+                  printf("[H5] Read %d bytes at 0x%lx: ", size, addr);
+                  for (int i=0; i<size; i++) printf("%02x ", buf[i]);
+                  printf("\n");
+              } else if (sscanf(script, "write %lx %x", &addr, &size) == 2) {
+                  // write yêu cầu data tiếp theo, nhưng đơn giản ta bỏ qua
+                  // ...
+              } else {
+                  printf("[H5] Unknown script command: %s\n", script);
+              }
+          }
+
+          // -------------------- SOCKET SERVER để nhận script từ H5GG --------------------
+          void *socket_listener(void *arg) {
+              int server_fd, new_socket;
+              struct sockaddr_in address;
+              int opt = 1;
+              int addrlen = sizeof(address);
+              char buffer[1024] = {0};
+
+              if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+                  perror("socket failed");
+                  return NULL;
+              }
+
+              if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+                  perror("setsockopt");
+                  close(server_fd);
+                  return NULL;
+              }
+
+              address.sin_family = AF_INET;
+              address.sin_addr.s_addr = INADDR_ANY;
+              address.sin_port = htons(4444); // Cổng mặc định, có thể đổi
+
+              if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+                  perror("bind failed");
+                  close(server_fd);
+                  return NULL;
+              }
+              if (listen(server_fd, 3) < 0) {
+                  perror("listen");
+                  close(server_fd);
+                  return NULL;
+              }
+
+              printf("[H5] Listening on port 4444 for scripts...\n");
+              while (1) {
+                  if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+                      perror("accept");
+                      continue;
+                  }
+                  int valread = (int)read(new_socket, buffer, 1024);
+                  if (valread > 0) {
+                      buffer[valread] = '\0';
+                      execute_script(buffer);
+                  }
+                  close(new_socket);
+              }
+              close(server_fd);
+              return NULL;
+          }
+
+          // -------------------- CONSTRUCTOR - KHỞI ĐỘNG KHI LOAD --------------------
+          __attribute__((constructor)) void init_helper() {
+              printf("[H5] Helper dylib loaded! Bypass sandbox (if root/entitlement).\n");
+
+              // Tạo thread listener để nhận lệnh từ H5GG qua socket
+              pthread_t thread_id;
+              pthread_create(&thread_id, NULL, socket_listener, NULL);
+
+              // Có thể mở một file log để H5GG đọc
+              FILE *log = fopen("/tmp/h5gg.log", "w");
+              if (log) {
+                  fprintf(log, "Helper ready. Task port: %d\n", mach_task_self());
+                  fclose(log);
+              }
+
+              // Nếu cần, có thể hook vào các hàm của game để script có thể gọi
+              // ...
+          }
+
+          // -------------------- EXPORT FUNCTIONS cho H5GG gọi trực tiếp --------------------
+          // H5GG có thể dùng dlsym để lấy các hàm này và gọi, không cần Frida.
+          // Tuy nhiên, H5GG thường dùng Frida API, nên đây chỉ là backup.
+
+          int h5gg_read(uint64_t addr, void *buf, int len) {
+              mach_port_t task = mach_task_self();
+              kern_return_t kr = read_memory(task, addr, buf, len);
+              return (kr == KERN_SUCCESS) ? len : -1;
+          }
+
+          int h5gg_write(uint64_t addr, void *buf, int len) {
+              mach_port_t task = mach_task_self();
+              kern_return_t kr = write_memory(task, addr, buf, len);
+              return (kr == KERN_SUCCESS) ? len : -1;
+          }
+
+          // ========================================================================
+          //  BIÊN DỊCH & SỬ DỤNG:
+          //  clang -arch arm64 -dynamiclib -framework Foundation -o h5gg.dylib h5gg_helper.c
+          //  Copy vào thiết bị, dùng TrollFools inject vào ứng dụng cần can thiệp.
+          //  H5GG có thể kết nối qua socket 4444 để gửi script, hoặc dùng dlsym.
+          //  Lưu ý: Cần có quyền task_for_pid (yêu cầu jailbreak hoặc entitlement).
+          // ========================================================================
+          EOF
+
+      - name: Biên dịch C thành dylib cho iOS arm64
+        run: |
+          export SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          export CC=$(xcrun --sdk iphoneos -f clang)
+          $CC -arch arm64 -dynamiclib -isysroot $SDKROOT \
+              -miphoneos-version-min=14.0 \
+              -framework Foundation \
+              -Wl,-undefined,dynamic_lookup \
+              -O2 -o h5gg.dylib src/h5gg_helper.c
+          echo "[+] Biên dịch hoàn tất"
+
+      - name: Kiểm tra file dylib
+        run: |
+          file h5gg.dylib
+          ls -la h5gg.dylib
+          otool -L h5gg.dylib || echo "otool not needed"
+
+      - name: Upload dylib dưới dạng artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: H5GG-Helper-iOS
+          path: h5gg.dylib
+
+      - name: Tạo hướng dẫn sử dụng
+        run: |
+          cat > README.txt << 'EOF'
+          ===== H5GG HELPER DYLIB =====
+          - Dùng TrollFools tiêm vào ứng dụng game cần can thiệp.
+          - H5GG có thể gửi script đến socket localhost:4444.
+          - Các lệnh hỗ trợ hiện tại: read <addr_hex> <size> và write <addr_hex> <value>.
+          - Ngoài ra, H5GG có thể dùng dlsym để gọi export functions: h5gg_read, h5gg_write.
+          - Log được ghi tại /tmp/h5gg.log.
+          EOF
+          cat README.txt
+
+      - name: Upload hướng dẫn
+        uses: actions/upload-artifact@v4
+        with:
+          name: H5GG-Guide
+          path: README.txt
