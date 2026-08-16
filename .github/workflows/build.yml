@@ -1,12 +1,9 @@
-# .github/workflows/build.yml – Bản sửa lỗi cho H5GG Helper (biên dịch C thành dylib)
-# Nguyên nhân lỗi thường gặp: SDK không tìm thấy, thiếu framework, cờ không đúng.
-# Bản này tự động kiểm tra SDK, sử dụng xcrun, thêm -fobjc-arc, -Wno-error.
-
-name: Build H5GG Helper Dylib (Fixed)
+name: Build iOS dylib
 
 on:
   push:
     branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -16,160 +13,69 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Tạo thư mục và mã nguồn C
+      - name: Create unlock.c
         run: |
-          mkdir -p src
-          cat > src/h5gg_helper.c << 'EOF'
-          // ========================================================================
-          //  h5gg_helper.c – Dylib hỗ trợ H5GG chạy script không cần Frida
-          //  Sử dụng mach_vm API, socket server port 4444
-          // ========================================================================
-
+          cat > unlock.c << 'EOF'
           #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <mach/mach.h>
-          #include <mach/mach_vm.h>
           #include <dlfcn.h>
-          #include <pthread.h>
-          #include <sys/socket.h>
-          #include <netinet/in.h>
-          #include <arpa/inet.h>
+          #include <string.h>
+          #include <mach/audit_token.h>
+          #include <sandbox.h>
+          #include "fishhook.h"
 
-          // Memory ops
-          kern_return_t read_memory(mach_port_t task, mach_vm_address_t addr, void *buffer, mach_vm_size_t size) {
-              mach_vm_size_t out_size = 0;
-              return mach_vm_read_overwrite(task, addr, size, (vm_address_t)buffer, &out_size);
+          int (*orig_sandbox_check)(const char *path, const char *operation, ...);
+          int (*orig_sandbox_check_with_audit_token)(audit_token_t token, const char *path, const char *operation, ...);
+
+          int my_sandbox_check(const char *path, const char *operation, ...) {
+              return 0;
           }
 
-          kern_return_t write_memory(mach_port_t task, mach_vm_address_t addr, void *buffer, mach_vm_size_t size) {
-              return mach_vm_write(task, addr, (vm_offset_t)buffer, size);
+          int my_sandbox_check_with_audit_token(audit_token_t token, const char *path, const char *operation, ...) {
+              return 0;
           }
 
-          // Script executor
-          void execute_script(const char *script) {
-              char cmd[256];
-              unsigned long addr;
-              int size;
-              if (sscanf(script, "read %lx %d", &addr, &size) == 2) {
-                  unsigned char buf[64];
-                  mach_port_t task = mach_task_self();
-                  read_memory(task, addr, buf, size);
-                  printf("[H5] Read %d bytes at 0x%lx: ", size, addr);
-                  for (int i=0; i<size; i++) printf("%02x ", buf[i]);
-                  printf("\n");
-              } else if (sscanf(script, "write %lx %x", &addr, &size) == 2) {
-                  // Simple write – expects data in next tokens, but simplified
-              } else {
-                  printf("[H5] Unknown command: %s\n", script);
+          __attribute__((constructor)) void init() {
+              struct rebinding rebindings[] = {
+                  {"sandbox_check", my_sandbox_check, (void *)&orig_sandbox_check},
+                  {"sandbox_check_with_audit_token", my_sandbox_check_with_audit_token, (void *)&orig_sandbox_check_with_audit_token}
+              };
+              rebind_symbols(rebindings, 2);
+
+              void *handle = dlopen("@loader_path/frida-gadget.dylib", RTLD_NOW);
+              if (handle) {
+                  void (*frida_init)(void) = dlsym(handle, "frida_init");
+                  if (frida_init) frida_init();
               }
-          }
-
-          // Socket listener
-          void *socket_listener(void *arg) {
-              int server_fd, new_socket;
-              struct sockaddr_in address;
-              int opt = 1;
-              int addrlen = sizeof(address);
-              char buffer[1024] = {0};
-
-              if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-                  perror("socket failed");
-                  return NULL;
-              }
-              setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-              address.sin_family = AF_INET;
-              address.sin_addr.s_addr = INADDR_ANY;
-              address.sin_port = htons(4444);
-
-              if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-                  perror("bind failed");
-                  close(server_fd);
-                  return NULL;
-              }
-              listen(server_fd, 3);
-              printf("[H5] Listening on port 4444\n");
-              while (1) {
-                  if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-                      perror("accept");
-                      continue;
-                  }
-                  int valread = (int)read(new_socket, buffer, 1024);
-                  if (valread > 0) {
-                      buffer[valread] = '\0';
-                      execute_script(buffer);
-                  }
-                  close(new_socket);
-              }
-              close(server_fd);
-              return NULL;
-          }
-
-          // Constructor
-          __attribute__((constructor)) void init_helper() {
-              printf("[H5] Helper loaded.\n");
-              pthread_t thread_id;
-              pthread_create(&thread_id, NULL, socket_listener, NULL);
-              FILE *log = fopen("/tmp/h5gg.log", "w");
-              if (log) {
-                  fprintf(log, "Helper ready. Task port: %d\n", mach_task_self());
-                  fclose(log);
-              }
-          }
-
-          // Export functions
-          int h5gg_read(uint64_t addr, void *buf, int len) {
-              return read_memory(mach_task_self(), addr, buf, len) == KERN_SUCCESS ? len : -1;
-          }
-          int h5gg_write(uint64_t addr, void *buf, int len) {
-              return write_memory(mach_task_self(), addr, buf, len) == KERN_SUCCESS ? len : -1;
           }
           EOF
 
-      - name: Kiểm tra SDK tồn tại
+      - name: Download fishhook
         run: |
-          xcrun --sdk iphoneos --show-sdk-path || echo "SDK not found, using default"
-          xcodebuild -version
+          curl -L -o fishhook.h https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h
+          curl -L -o fishhook.c https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c
 
-      - name: Biên dịch dylib với cờ đầy đủ
-        run: |
-          SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk")
-          CC=$(xcrun --sdk iphoneos -f clang)
-          $CC -arch arm64 -dynamiclib \
-              -isysroot "$SDKROOT" \
-              -miphoneos-version-min=14.0 \
-              -framework Foundation \
-              -Wl,-undefined,dynamic_lookup \
-              -fobjc-arc \
-              -Wno-error \
-              -O2 \
-              -o h5gg.dylib src/h5gg_helper.c
-          echo "Build success"
+      - name: List files (debug)
+        run: ls -la
 
-      - name: Kiểm tra file output
+      - name: Build dylib
         run: |
-          file h5gg.dylib
-          ls -la h5gg.dylib
-          otool -L h5gg.dylib || true
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK path: $SDK_PATH"
+          clang -arch arm64 \
+                -isysroot $SDK_PATH \
+                -dynamiclib \
+                -miphoneos-version-min=12.0 \
+                -Os \
+                -Wno-implicit-function-declaration \
+                -Wno-return-type \
+                -o libunlock.dylib \
+                unlock.c fishhook.c \
+                2>&1 | tee build.log
+          cat build.log
+          ls -la libunlock.dylib || echo "File not found!"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: H5GG-Helper-Fixed
-          path: h5gg.dylib
-
-      - name: Tạo hướng dẫn
-        run: |
-          cat > README.txt << 'EOF'
-          === H5GG HELPER (FIXED) ===
-          - Inject dylib vào game qua TrollFools.
-          - Script gửi qua localhost:4444.
-          - Lệnh: "read <addr_hex> <size>" hoặc "write <addr_hex> <value>".
-          - Log ở /tmp/h5gg.log.
-          EOF
-      - name: Upload guide
-        uses: actions/upload-artifact@v4
-        with:
-          name: Guide
-          path: README.txt
+          name: libunlock
+          path: libunlock.dylib
